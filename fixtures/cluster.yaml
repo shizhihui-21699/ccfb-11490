@@ -1,0 +1,352 @@
+# Synthetic cluster snapshot used by the test suite and the in-app demo.
+#
+# It is a "messy but realistic" dump: namespaced SAs, a CI SA that looks
+# harmless, a ServiceAccount with a single `impersonate serviceaccounts` rule,
+# an aggregate ClusterRole, and token Secrets. Each planted escalation path is
+# listed in fixtures/README.md.
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: ci}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: metrics}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: payments}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: kube-system}
+---
+# ---------------------------------------------------------------- SAs
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: builder, namespace: ci}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: deployer, namespace: ci}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: cert-bot, namespace: ci}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: prometheus, namespace: metrics}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: breakglass, namespace: payments}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: default, namespace: ci}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: default, namespace: metrics}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: default, namespace: payments}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: default, namespace: kube-system}
+---
+
+# ===========================================================================
+# PATH A — "the CI runner only creates Pods"
+#
+#   ci/builder  --create pods-->  ci/deployer  --bind cluster-admin--> cluster-admin
+#
+# builder cannot touch RBAC at all. It only creates Pods in ci, which lets it
+# take on deployer's identity; deployer holds the classic `bind` + `create
+# clusterrolebindings` pair.
+# ===========================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: ci-pod-runner, namespace: ci}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec"]
+    verbs: ["create", "get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: ci-pod-runner-binding, namespace: ci}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: ci-pod-runner}
+subjects:
+  - {kind: ServiceAccount, name: builder, namespace: ci}
+---
+# deployer's own role looks like a normal "deploy apps" role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: deployer-role, namespace: ci}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "secrets"]
+    verbs: ["*"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: deployer-binding, namespace: ci}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: deployer-role}
+subjects:
+  - {kind: ServiceAccount, name: deployer, namespace: ci}
+---
+# The escalation primitive: bind any of the grantable ClusterRoles.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: release-binding-granter}
+rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings"]
+    verbs: ["create"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames: ["admin", "edit", "view", "cluster-admin"]
+    verbs: ["bind"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: release-binding-granter-binding}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: release-binding-granter}
+subjects:
+  - {kind: ServiceAccount, name: deployer, namespace: ci}
+---
+
+# ===========================================================================
+# PATH B — "a metrics SA that can only impersonate in its own namespace"
+#
+#   metrics/default --impersonate SA--> metrics/prometheus
+#                   --escalate its own ClusterRole--> cluster-admin
+#
+# Neither link looks dangerous alone: impersonation is namespace-scoped, and
+# `escalate` only edits a role prometheus is already bound to. Together they
+# reach the top because the aggregated rules of that role are then wildcarded.
+# ===========================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: sa-impersonator, namespace: metrics}
+rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["impersonate"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: sa-impersonator-binding, namespace: metrics}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: sa-impersonator}
+subjects:
+  - {kind: ServiceAccount, name: default, namespace: metrics}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: metrics-scraper-cluster}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: prometheus-scraper}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: metrics-scraper-cluster}
+subjects:
+  - {kind: ServiceAccount, name: prometheus, namespace: metrics}
+---
+# prometheus may maintain its own ClusterRole — but `escalate` means it may
+# write `*` into it, and it is already bound to it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: metrics-role-editor}
+rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames: ["metrics-scraper-cluster"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames: ["metrics-scraper-cluster"]
+    verbs: ["escalate"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: metrics-role-editor-binding}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: metrics-role-editor}
+subjects:
+  - {kind: ServiceAccount, name: prometheus, namespace: metrics}
+---
+
+# ===========================================================================
+# PATH C — "aggregation hides a Secret reader behind a breakglass SA"
+#
+#   payments/default --aggregated ClusterRole--> get secrets in payments
+#                    --read token Secret--> payments/breakglass
+#                    --ClusterRoleBinding to cluster-admin--> cluster-admin
+#
+# The aggregated ClusterRole has an empty `rules:` field. Unless you expand it
+# you see no permissions at all.
+# ===========================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: payments-operator}
+aggregationRule:
+  clusterRoleSelectors:
+    - matchLabels:
+        rbac.example.com/aggregate-to-payments: "true"
+rules: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: payments-operator-secrets
+  labels:
+    rbac.example.com/aggregate-to-payments: "true"
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: payments-operator-binding, namespace: payments}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: payments-operator}
+subjects:
+  - {kind: ServiceAccount, name: default, namespace: payments}
+---
+# A break-glass SA with cluster-admin, kept "for emergencies". Reaching its
+# token is the whole point of the Secret read above.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: breakglass-admin}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cluster-admin}
+subjects:
+  - {kind: ServiceAccount, name: breakglass, namespace: payments}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: breakglass-token
+  namespace: payments
+  annotations:
+    kubernetes.io/service-account.name: breakglass
+type: kubernetes.io/service-account-token
+data: {token: c2VjcmV0, ca.crt: Y2E=, namespace: cGF5bWVudHM=}
+---
+
+# ===========================================================================
+# PATH D — impersonating a group (hidden)
+#
+#   alice --impersonate groups--> system:masters  == cluster-admin
+#
+# `system:masters` bypasses RBAC entirely inside the API server, so no
+# ClusterRoleBinding is required.
+# ===========================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: group-impersonator}
+rules:
+  - apiGroups: [""]
+    resources: ["groups"]
+    verbs: ["impersonate"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: group-impersonator-binding}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: group-impersonator}
+subjects:
+  - {kind: User, name: alice@example.com}
+---
+
+# ===========================================================================
+# PATH E — CSR forging (hidden)
+#
+#   ci/cert-bot --create CSR + approve signers/kubernetes.io/*--> cluster-admin
+# ===========================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: csr-issuer}
+rules:
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests"]
+    verbs: ["create", "get", "list", "watch"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests/approval"]
+    verbs: ["update"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["signers"]
+    resourceNames: ["kubernetes.io/kube-apiserver-client"]
+    verbs: ["approve"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: csr-issuer-binding}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: csr-issuer}
+subjects:
+  - {kind: ServiceAccount, name: cert-bot, namespace: ci}
+---
+
+# ===========================================================================
+# Objects used by the reverse ("who can read this namespace's Secrets") query
+# ===========================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: deployer-token
+  namespace: ci
+  annotations:
+    kubernetes.io/service-account.name: deployer
+type: kubernetes.io/service-account-token
+data: {token: c2VjcmV0, ca.crt: Y2E=}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-password
+  namespace: payments
+type: Opaque
+data: {password: c2VjcmV0}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: payments-api-0
+  namespace: payments
+  labels: {app: payments-api}
+spec:
+  serviceAccountName: default
+  nodeName: node-a
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ci-runner
+  namespace: ci
+  labels: {app: ci-runner}
+spec:
+  serviceAccountName: builder
+  nodeName: node-a
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: metrics-agent
+  namespace: metrics
+spec:
+  serviceAccountName: prometheus
+  nodeName: node-b
